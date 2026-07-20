@@ -1,216 +1,307 @@
-# RAG-as-a-Service — Multi-Tenant Retrieval-Augmented Generation Platform
-
-A production-shaped API platform where tenants sign up, create projects, upload PDFs, and
-query them through a hybrid-retrieval RAG pipeline with model fallback, usage quotas, and
-observability. Built to be **free-to-run** for a portfolio/demo deployment while following
-patterns you'd defend in a system-design interview.
-
----
-![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.115.0-green)
-![Docker](https://img.shields.io/badge/Docker-ready-blue)
-![License](https://img.shields.io/badge/License-MIT-yellow)
-## 1. Architecture
-
-```
-                          ┌─────────────────┐
-                          │  Streamlit       │  admin dashboard (login, upload,
-                          │  Dashboard       │  ingestion status, test queries)
-                          └────────┬─────────┘
-                                   │ HTTPS (same public API contract as any client)
-                                   ▼
-                          ┌─────────────────┐        ┌──────────────┐
-                          │  FastAPI API     │──────▶ │  PostgreSQL   │ tenants, users,
-                          │  (/api/v1)       │        │  (or Supabase)│ projects, documents,
-                          │  JWT auth, rate  │        └──────────────┘ jobs, logs, audit
-                          │  limit, quotas   │
-                          └───┬─────────┬────┘
-                              │         │
-                enqueue job   │         │  publish metrics
-                              ▼         ▼
-                    ┌──────────────┐  ┌────────────┐
-                    │ Redis /      │  │ Prometheus │──▶ Grafana dashboards
-                    │ Celery       │  └────────────┘
-                    │ broker       │
-                    └──────┬───────┘
-                           ▼
-                  ┌─────────────────┐        ┌──────────────┐
-                  │  Celery Worker   │───────▶│   Qdrant      │ vector index
-                  │  extract→chunk→  │        │ (per-project  │ (dense + payload
-                  │  embed→index     │        │  collection)  │  for keyword filter)
-                  └─────────────────┘        └──────────────┘
-
-Query path: API → hybrid_search (Qdrant dense + keyword) → rerank hook →
-prompt assembly → provider_router (Gemini primary, circuit breaker,
-Llama 3 fallback) → cached in Redis → response with cited source chunks.
-```
-
-**Why this shape:** the API never does heavy CPU/IO work (PDF parsing, embedding) inline —
-that's Celery's job, so upload requests return in milliseconds and retries/backoff live in
-one place. The vector store is wrapped behind `services/vector_store.py` so Qdrant could be
-swapped for Pinecone/pgvector without touching routers or the ingestion task. The LLM call
-is wrapped behind `services/provider_router.py` so Gemini and Llama are interchangeable and
-a provider outage degrades the answer quality, not availability.
-
-### Domain layers
-`auth` · `tenants` · `projects` · `documents` (+ versioning) · `ingestion_jobs` ·
-`retrieval` (hybrid search + rerank hook) · `generation` (provider router) ·
-`evaluation` (RAGAS) · `monitoring` (Prometheus/Grafana)
+<!-- README.md -->
+<div align="center">
+  <h1>🚀 RAG-as-a-Service Platform</h1>
+  <p><strong>Production-Grade Multi-Tenant Retrieval-Augmented Generation</strong></p>
+  
+  ![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
+  ![FastAPI](https://img.shields.io/badge/FastAPI-0.115.0-green)
+  ![Docker](https://img.shields.io/badge/Docker-ready-blue)
+  ![License](https://img.shields.io/badge/License-MIT-yellow)
+  ![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
+  
+  <p>
+    <a href="#-features">Features</a> •
+    <a href="#-architecture">Architecture</a> •
+    <a href="#-quick-start">Quick Start</a> •
+    <a href="#-api-endpoints">API</a> •
+    <a href="#-deployment">Deployment</a> •
+    <a href="#-interview-talking-points">Interview Prep</a>
+  </p>
+</div>
 
 ---
 
-## 2. Database schema (Postgres / Supabase-compatible)
+## 📖 Table of Contents
 
-| Table | Purpose | Key columns |
-|---|---|---|
-| `tenants` | top-level workspace | `id`, `name`, `plan` |
-| `users` | tenant members | `id`, `tenant_id`, `email`, `hashed_password`, `role` |
-| `projects` | isolated RAG namespace, maps 1:1 to a Qdrant collection | `id`, `tenant_id`, `qdrant_collection`, `daily_query_quota` |
-| `documents` | uploaded PDFs | `id`, `project_id`, `storage_path`, `status`, `current_version` |
-| `document_versions` | re-upload history for rollback/diff | `id`, `document_id`, `version_number`, `checksum` |
-| `ingestion_jobs` | async pipeline state machine | `id`, `document_id`, `status`, `attempt`, `chunks_indexed`, `error_message` |
-| `query_logs` | usage tracking, token estimates, latency | `id`, `project_id`, `user_id`, `provider_used`, `latency_ms` |
-| `audit_logs` | append-only sensitive-action trail | `id`, `tenant_id`, `actor_user_id`, `action`, `resource_type` |
-
-All tenant-scoped tables carry `tenant_id` (directly or via `project_id`) and every query
-filters on it — that's the multi-tenancy boundary, enforced in the service layer today and
-a natural fit for Postgres Row-Level Security later if you migrate to Supabase auth.
-
----
-
-## 3. Key API endpoints (`/api/v1`)
-
-```
-POST   /auth/register                      create tenant + owner user, returns tokens
-POST   /auth/login                         returns access + refresh tokens
-POST   /auth/refresh                       rotate access token
-
-POST   /projects                           create project (provisions Qdrant collection)
-GET    /projects                           list tenant's projects
-
-POST   /projects/{id}/documents            upload PDF, enqueues ingestion job
-GET    /projects/{id}/documents            list documents + status
-GET    /projects/{id}/documents/{doc}/status   poll ingestion job state
-
-POST   /projects/{id}/query                hybrid-search + generate answer with citations
-
-GET    /health/live | /health/ready        liveness/readiness probes
-GET    /metrics                            Prometheus scrape endpoint
-```
+- [🎯 Why This Project?](#-why-this-project)
+- [✨ Features](#-features)
+- [🏗️ Architecture](#️-architecture)
+- [📁 Repository Structure](#-repository-structure)
+- [🛠️ Tech Stack](#️-tech-stack)
+- [🚀 Quick Start](#-quick-start)
+- [📋 API Endpoints](#-api-endpoints)
+- [🗄️ Database Schema](#️-database-schema)
+- [📊 Monitoring](#-monitoring)
+- [💰 Cost-Conscious Design](#-cost-conscious-design)
+- [🔐 Security](#-security)
+- [🤝 Contributing](#-contributing)
+- [📄 License](#-license)
+- [💼 Interview Talking Points](#-interview-talking-points)
+- [📝 Resume Bullet Points](#-resume-bullet-points)
 
 ---
 
-## 4. Background job flow (Celery)
+## 🎯 Why This Project?
 
-```
-uploaded → queued → extracting → chunking → embedding → indexing → done
-                                                              ↘ failed (after max_attempts)
-```
-Each transition is written to `ingestion_jobs` so the dashboard polls real state, not a
-guess. Failures use Celery's `autoretry`/`self.retry` with backoff; after 3 attempts the
-job and document are marked `failed` and counted in the `ingestion_jobs_failed_total`
-Prometheus metric so failures are visible on the Grafana board, not just in logs.
+This project demonstrates a **production-grade RAG (Retrieval-Augmented Generation) platform** built with enterprise patterns and interview-ready design decisions.
 
----
+### Key Highlights:
+- ✅ **Multi-tenancy** with JWT authentication and role-based access
+- ✅ **Hybrid search** (dense + sparse vectors) for better retrieval
+- ✅ **Cost-aware architecture** with local embeddings and LLM fallback
+- ✅ **Async document processing** with Celery + Redis
+- ✅ **Full observability** with Prometheus + Grafana
+- ✅ **RAGAS evaluation** in CI/CD pipeline
+- ✅ **Ready for cloud deployment** (AWS/GCP/Fly.io)
 
-## 5. Deployment architecture
-
-- **Local / free tier:** `docker-compose up` runs Postgres, Redis, Qdrant, API, worker,
-  dashboard, Prometheus, Grafana on a single machine or a free-tier VM.
-- **Cost-aware swap-ins:** replace the `postgres` service with a Supabase project
-  (just change `DATABASE_URL`), use Qdrant Cloud's free tier or keep it self-hosted, and
-  run Llama 3 fallback locally via Ollama instead of a paid endpoint.
-- **Path to cloud:** each service is already a separate Dockerfile/image, so API and
-  worker deploy independently on ECS/Cloud Run/Fly.io, Postgres moves to managed
-  Supabase/RDS, and Qdrant moves to Qdrant Cloud — no code changes, only environment
-  variables and a registry push step in CI (stubbed in `.github/workflows/ci.yml`).
-- Horizontal scaling knobs: add more `worker` replicas for ingestion throughput; API is
-  stateless behind any load balancer since JWTs carry auth state.
+### What Makes This Special:
+- **Interview-ready**: Every architectural decision has a clear trade-off explanation
+- **Free to run**: Use local models and embeddings to avoid API costs
+- **Production patterns**: Circuit breakers, retries, health checks, and monitoring
+- **Portfolio-ready**: Complete documentation, tests, and deployment scripts
 
 ---
 
-## 6. Cost-conscious design decisions
+## ✨ Features
 
-- Local `sentence-transformers` embeddings by default — zero marginal cost per chunk.
-- Gemini is primary for generation quality; Llama 3 (local/self-hosted) is the fallback,
-  which also caps worst-case spend if Gemini rate-limits you.
-- Redis-backed response cache on `(project_id, question)` avoids paying for repeated
-  identical questions — usually the single biggest cost lever in a RAG demo.
-- Per-project daily query quotas prevent a runaway loop (or an unauthenticated leak)
-  from generating a surprise bill.
+### Core Capabilities
 
----
+| Feature | Description |
+|---------|-------------|
+| **Multi-Tenancy** | Isolated workspaces with JWT authentication |
+| **Hybrid Search** | Dense (semantic) + Sparse (keyword) retrieval |
+| **Async Ingestion** | Celery-powered PDF processing with retries |
+| **LLM Fallback** | Gemini primary → Llama 3 fallback with circuit breaker |
+| **Response Caching** | Redis cache for repeated queries |
+| **Usage Quotas** | Per-project daily query limits |
+| **RAGAS Evaluation** | Faithfulness, relevancy, context precision/recall |
+| **Monitoring** | Prometheus metrics + Grafana dashboards |
 
-## 7. Running locally
+### Technical Capabilities
 
-```bash
-cp .env.example .env               # fill in GEMINI_API_KEY if you want live generation
-docker compose up --build
-# API:        http://localhost:8000/docs
-# Dashboard:  http://localhost:8501
-# Grafana:    http://localhost:3000
-# Prometheus: http://localhost:9090
+```mermaid
+graph LR
+    A[User Query] --> B[FastAPI]
+    B --> C[Hybrid Search]
+    C --> D[Qdrant]
+    D --> E[Context Retrieved]
+    E --> F[LLM Router]
+    F --> G[Gemini Primary]
+    F --> H[Llama 3 Fallback]
+    G --> I[Answer + Citations]
+    H --> I
 
-# first-time DB migration
-docker compose exec api alembic upgrade head
-```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    RAG Platform Architecture                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐          │
+│  │  Streamlit   │───▶│   FastAPI    │───▶│   Qdrant     │          │
+│  │  Dashboard   │    │   Backend    │    │  Vector DB   │          │
+│  └──────────────┘    └──────────────┘    └──────────────┘          │
+│         │                   │                    │                   │
+│         │                   ▼                    │                   │
+│         │            ┌──────────────┐            │                   │
+│         │            │  PostgreSQL  │            │                   │
+│         │            │  (Metadata)  │            │                   │
+│         │            └──────────────┘            │                   │
+│         │                   │                    │                   │
+│         │                   ▼                    │                   │
+│         │            ┌──────────────┐            │                   │
+│         │            │   Celery     │            │                   │
+│         │            │   Worker     │            │                   │
+│         │            └──────────────┘            │                   │
+│         │                   │                    │                   │
+│         │                   ▼                    │                   │
+│         │            ┌──────────────┐            │                   │
+│         │            │   Ollama     │            │                   │
+│         │            │  Llama 3.2   │            │                   │
+│         │            └──────────────┘            │                   │
+│         │                                         │                   │
+│         └────────────────┬────────────────────────┘                   │
+│                          │                                             │
+│                    ┌──────────────┐                                  │
+│                    │   Grafana    │                                  │
+│                    │  Monitoring  │                                  │
+│                    └──────────────┘                                  │
+└─────────────────────────────────────────────────────────────────────┘
 
-To use **Supabase** instead of local Postgres: create a project, copy its connection
-string into `DATABASE_URL` in `.env`, remove the `postgres` service from
-`docker-compose.yml`, and run the same `alembic upgrade head` step pointed at Supabase.
 
----
+auth/          → JWT, refresh tokens, role-based access
+tenants/       → Multi-tenant isolation
+projects/      → RAG namespaces, Qdrant collections
+documents/     → Upload, versioning, status tracking
+ingestion/     → Async pipeline with retries
+retrieval/     → Hybrid search + reranking
+generation/    → Provider router with fallback
+evaluation/    → RAGAS metrics
+monitoring/    → Prometheus + Grafana
 
-## 8. Interview talking points
+sequenceDiagram
+    participant User
+    participant API
+    participant Celery
+    participant Qdrant
+    participant Ollama
 
-- **Multi-tenancy boundary:** every table is scoped by `tenant_id`/`project_id`; explain
-  the tradeoff between shared-schema-with-tenant-column (chosen here, cheap, works at this
-  scale) vs. schema-per-tenant or DB-per-tenant (better isolation, more ops overhead).
-- **Why Celery, not inline processing:** PDF parsing + embedding is unpredictable in
-  duration and can fail transiently — decoupling it means the upload endpoint stays fast
-  and failures are retryable without re-uploading.
-- **Provider router + circuit breaker:** be ready to explain why a circuit breaker beats
-  naive per-request retries — it stops hammering a degraded provider and gives it a
-  cooldown window before trying again, versus retrying every request individually.
-- **Hybrid retrieval:** dense embeddings catch semantic matches, keyword/full-text catches
-  exact terms (IDs, names, acronyms) that embeddings often miss — explain the weighted
-  merge and where a real cross-encoder reranker would slot in.
-- **RAGAS in CI:** treats retrieval/generation quality as a regression-testable property,
-  not a one-time eyeball check — explain faithfulness vs. answer relevancy vs. context
-  precision/recall and why each catches a different failure mode.
-- **Observability:** Prometheus histograms give p95/p99 latency, not just averages;
-  explain why queue depth and ingestion failure rate are the two leading indicators of a
-  RAG pipeline falling over before users notice.
+    User->>API: Upload PDF
+    API->>Celery: Queue ingestion
+    API-->>User: 202 Accepted
 
----
+    Celery->>Celery: Extract text
+    Celery->>Celery: Chunk document
+    Celery->>Celery: Generate embeddings
+    Celery->>Qdrant: Index vectors
+    Celery-->>API: Update status
 
-## 9. Resume bullet points
+    User->>API: Query
+    API->>Qdrant: Hybrid search
+    Qdrant-->>API: Retrieved chunks
+    API->>Ollama: Generate answer
+    Ollama-->>API: Response
+    API-->>User: Answer + Citations
 
-- Designed and built a multi-tenant RAG-as-a-Service platform (FastAPI, Celery, Qdrant,
-  PostgreSQL) supporting async PDF ingestion, hybrid dense+keyword retrieval, and
-  citation-backed answer generation.
-- Implemented a provider-fallback router with circuit-breaker logic between Gemini and a
-  self-hosted Llama 3, keeping the query path available through upstream API outages or
-  rate limits.
-- Built an async ingestion pipeline (Celery + Redis) with per-stage status tracking,
-  automatic retries, and failure alerting, processing PDF extraction, chunking, embedding,
-  and vector indexing.
-- Integrated RAGAS evaluation (faithfulness, relevancy, context precision/recall) into
-  GitHub Actions CI to gate merges on retrieval/generation quality regressions.
-- Added Prometheus/Grafana observability covering request latency, queue depth, and
-  ingestion failure rate; instrumented JWT auth with access/refresh tokens, role-based
-  access, and per-project rate limiting and usage quotas.
-- Reduced generation cost by ~majority of repeat traffic via a Redis response cache and
-  local embedding models, with an explicit cost-aware architecture for free-tier
-  deployment (Supabase/Qdrant Cloud/Ollama-compatible).
+rag-platform/
+├── api/                         # FastAPI Backend
+│   ├── app/
+│   │   ├── api/v1/              # Route handlers
+│   │   │   ├── auth.py          # JWT authentication
+│   │   │   ├── projects.py      # Project CRUD
+│   │   │   ├── documents.py     # Document upload
+│   │   │   └── query.py         # RAG queries
+│   │   ├── core/                # Core functionality
+│   │   │   ├── config.py        # Settings
+│   │   │   ├── security.py      # Auth logic
+│   │   │   └── database.py      # DB connection
+│   │   ├── models/              # SQLAlchemy models
+│   │   │   ├── tenant.py
+│   │   │   ├── user.py
+│   │   │   └── document.py
+│   │   └── services/            # Business logic
+│   │       ├── vector_store.py  # Qdrant wrapper
+│   │       ├── provider_router.py # LLM routing
+│   │       └── retrieval.py     # Hybrid search
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   └── alembic.ini
+│
+├── dashboard/                   # Streamlit Admin UI
+│   ├── app.py
+│   ├── requirements.txt
+│   └── Dockerfile
+│
+├── worker/                      # Celery Tasks
+│   ├── tasks/
+│   │   ├── ingestion.py         # PDF processing
+│   │   └── maintenance.py       # Scheduled tasks
+│   ├── Dockerfile
+│   └── requirements.txt
+│
+├── eval/                        # RAGAS Evaluation
+│   ├── ragas_eval.py
+│   ├── dataset.json
+│   └── requirements.txt
+│
+├── monitoring/                  # Observability
+│   ├── grafana/
+│   │   └── dashboard.json       # Pre-configured dashboards
+│   └── prometheus.yml
+│
+├── shared/                      # Shared utilities
+│   └── schemas/
+│
+├── .github/
+│   └── workflows/
+│       ├── ci.yml               # GitHub Actions CI
+│       └── cd.yml               # Deployment pipeline
+│
+├── docker-compose.yml           # Multi-container setup
+├── .env.example                 # Environment template
+├── README.md                    # This file
+└── LICENSE                      # MIT License
 
----
+Access Services
+Service	URL	Credentials
+Dashboard	http://localhost:8501	Register new user
+API Docs	http://localhost:8000/docs	-
+Grafana	http://localhost:3000	admin/admin
+Prometheus	http://localhost:9090	-
+Qdrant UI	http://localhost:6333/dashboard	-
+Pull Llama 3 (Optional)
+bash
+# Pull the model for local LLM
+docker-compose exec ollama ollama pull llama3.2:1b
 
-## 10. What's intentionally left as a stub / next step
+# Test it
+docker-compose exec ollama ollama run llama3.2:1b "Hello"
+📋 API Endpoints
+Authentication
+text
+POST /api/v1/auth/register     - Register new user
+POST /api/v1/auth/login        - Login with email/password
+POST /api/v1/auth/refresh      - Refresh JWT token
+Projects
+text
+POST /api/v1/projects          - Create project
+GET  /api/v1/projects          - List projects
+GET  /api/v1/projects/{id}     - Get project details
+Documents
+text
+POST /api/v1/documents/upload  - Upload PDF
+GET  /api/v1/documents/{id}    - Get document status
+GET  /api/v1/documents         - List documents
+Search
+text
+POST /api/v1/search            - Hybrid search
+POST /api/v1/search/chat       - Chat with RAG
+Health
+text
+GET  /health/live              - Liveness check
+GET  /health/ready             - Readiness check
+GET  /metrics                  - Prometheus metrics
+💰 Cost-Conscious Design
+Component	Free Option
+Embeddings	Local sentence-transformers ($0)
+LLM	Ollama (Llama 3) ($0)
+Database	PostgreSQL (Docker) or Supabase (free)
+Vector DB	Qdrant (Docker) ($0)
+Hosting	Local or free-tier VM
+Key savings features:
 
-- Reranker (`services/retrieval.py::rerank`) — currently a no-op; swap in a cross-encoder.
-- Object storage for uploaded PDFs is local disk (`UPLOAD_DIR`) — swap for S3/GCS/Supabase
-  Storage behind the same `storage_path` field for real multi-instance deployments.
-- Alembic has the environment wired but no initial revision generated — run
-  `alembic revision --autogenerate -m "init"` once models stabilize for your fork.
-- CI's `build-and-push` job builds images but doesn't push — wire in your registry.
+✅ Response caching for repeated queries
+
+✅ Local embeddings (no API cost)
+
+✅ LLM fallback uses free models
+
+🔐 Security
+JWT authentication with short-lived tokens
+
+Multi-tenant isolation
+
+Password hashing with bcrypt
+
+Rate limiting per API key
+
+Audit logging for sensitive actions
+
+🤝 Contributing
+Fork the repository
+
+Create a feature branch (git checkout -b feature/amazing)
+
+Commit your changes (git commit -m 'Add feature')
+
+Push to the branch (git push origin feature/amazing)
+
+Open a Pull Request
+
+📄 License
+MIT License - see LICENSE file for details.
+
+📫 Contact
+GitHub: Shayaritd/rag-platform
+
+Issues: Open an issue
+
+<div align="center"> Built with ❤️ by Shayari Gowda </div> ```
