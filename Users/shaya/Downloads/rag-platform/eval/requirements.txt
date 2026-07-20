@@ -1,3 +1,0 @@
-ragas==0.1.20
-datasets==2.21.0
-requests==2.32.3
