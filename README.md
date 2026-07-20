@@ -6,7 +6,10 @@ observability. Built to be **free-to-run** for a portfolio/demo deployment while
 patterns you'd defend in a system-design interview.
 
 ---
-
+![Python](https://img.shields.io/badge/Python-3.11%2B-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115.0-green)
+![Docker](https://img.shields.io/badge/Docker-ready-blue)
+![License](https://img.shields.io/badge/License-MIT-yellow)
 ## 1. Architecture
 
 ```
