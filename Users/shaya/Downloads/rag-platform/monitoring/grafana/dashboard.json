@@ -1,0 +1,11 @@
+{
+  "title": "RAG Platform Overview",
+  "panels": [
+    {"title": "Request Latency (p95)", "type": "graph", "targets": [{"expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))"}]},
+    {"title": "Query Throughput (req/s)", "type": "graph", "targets": [{"expr": "rate(http_requests_total{handler=~\".*query.*\"}[1m])"}]},
+    {"title": "Ingestion Failure Rate", "type": "graph", "targets": [{"expr": "rate(ingestion_jobs_failed_total[5m])"}]},
+    {"title": "Celery Queue Depth", "type": "graph", "targets": [{"expr": "celery_queue_length{queue=\"celery\"}"}]},
+    {"title": "LLM Provider Split (Gemini vs Llama)", "type": "piechart", "targets": [{"expr": "sum by (provider) (rate(query_provider_used_total[1h]))"}]},
+    {"title": "5xx Error Rate", "type": "graph", "targets": [{"expr": "rate(http_requests_total{status=~\"5..\"}[5m])"}]}
+  ]
+}
